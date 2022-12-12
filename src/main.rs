@@ -2,10 +2,11 @@ use anyhow::Result;
 use chrono::{prelude::*, Duration};
 use chrono_tz::Tz;
 use clap::Parser;
-use orgize::{elements::Title, Org};
+use orgize::Org;
 use std::{borrow::Cow, ffi::OsString, fs, path::Path, str::FromStr};
 
 #[derive(Parser)]
+#[command(about = "check your org files for stranger things")]
 struct CheckOrgOptions {
     #[arg(long = "duration-mismatch", default_value_t = true)]
     report_duration_mismatch: bool,
