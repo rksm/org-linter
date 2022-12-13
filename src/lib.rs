@@ -168,8 +168,6 @@ mod headline_tests {
 pub struct Clock<'a> {
     pub line: usize,
     pub parent: usize,
-    start_string: &'a str,
-    end_string: Option<&'a str>,
     pub duration_string: Option<&'a str>,
     pub start: NaiveDateTime,
     pub end: Option<NaiveDateTime>,
@@ -197,8 +195,12 @@ impl<'a> Clock<'a> {
     pub fn matches_duration(&self) -> bool {
         let (Some(duration_string), Some(end)) = (self.duration_string, self.end) else {return false};
         let Some((h, m)) = duration_string.split_once(':') else {return false};
-        (Duration::hours(h.parse().unwrap_or(0)) + Duration::minutes(m.parse().unwrap_or(0)))
-            == (end - self.start)
+        let negative = h.starts_with('-');
+        let parsed = Duration::hours(i64::abs(h.parse().unwrap_or(0)))
+            + Duration::minutes(m.parse().unwrap_or(0));
+        let parsed = if negative { -parsed } else { parsed };
+        let actual = end - self.start;
+        parsed == actual
     }
 }
 
@@ -210,11 +212,15 @@ static CLOCK_RE: Lazy<Regex> = Lazy::new(|| {
         r"(?ix)
 \s*clock:\s*                                      # CLOCK:
 [\[<]                                             # < or [
-([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[a-z]+\s+[0-9:]+)   # timestamp like [2022-12-12 Mon 19:49]
+([0-9]{4})-([0-9]{2})-([0-9]{2})                  # yyyy-mm-dd
+\s+[a-z]+\s+                                      # day of week (can be localized)
+([0-9]{2}):([0-9]{2})                             # HH:MM
 [\]>]                                             # > or ]
 (?:\s*--\s*                                       # parse end timestamp
 [\[<]
-([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[a-z]+\s+[0-9:]+)
+([0-9]{4})-([0-9]{2})-([0-9]{2})                  # yyyy-mm-dd
+\s+[a-z]+\s+                                      # day of week (can be localized)
+([0-9]{2}):([0-9]{2})                             # HH:MM
 [\]>]
 )?
 (?:\s*=>\s*                                       # parse duration
@@ -225,25 +231,54 @@ static CLOCK_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("clock re")
 });
 
-const TIME_FORMAT: &str = "%Y-%m-%d %a %H:%M";
-
 impl<'a> TryFrom<&'a str> for Clock<'a> {
     type Error = anyhow::Error;
 
     fn try_from(s: &'a str) -> Result<Self, Self::Error> {
         if let Some(captures) = CLOCK_RE.captures(s) {
-            let start_string = &captures.get(1).unwrap().as_str();
-            let end_string = captures.get(2).map(|m| m.as_str());
-            let duration_string = captures.get(3).map(|m| m.as_str());
-            let start =
-                NaiveDateTime::parse_from_str(start_string, TIME_FORMAT).map_err(|err| {
-                    error!("error parsing start: {start_string:?}");
-                    anyhow::anyhow!("error parsing start: {err}")
-                })?;
-            let end = if let Some(end_string) = end_string {
+            fn datetime(
+                year: &str,
+                month: &str,
+                day: &str,
+                hour: &str,
+                min: &str,
+            ) -> Result<NaiveDateTime> {
+                let Some(d) = Local.with_ymd_and_hms(year.parse()?, month.parse()?, day.parse()?, hour.parse()?, min.parse()?, 0).single() else {
+                    return Err(anyhow::anyhow!("unable create date"))
+                };
+                Ok(d.naive_local())
+            }
+
+            let full = captures.get(0).unwrap().as_str();
+
+            let start = datetime(
+                captures.get(1).unwrap().as_str(),
+                captures.get(2).unwrap().as_str(),
+                captures.get(3).unwrap().as_str(),
+                captures.get(4).unwrap().as_str(),
+                captures.get(5).unwrap().as_str(),
+            )
+            .map_err(|err| {
+                error!("error parsing start: {full:?}");
+                anyhow::anyhow!("error parsing start: {err}")
+            })?;
+
+            let end = if let (
+                Some(end_year),
+                Some(end_month),
+                Some(end_day),
+                Some(end_hour),
+                Some(end_min),
+            ) = (
+                captures.get(6).map(|c| c.as_str()),
+                captures.get(7).map(|c| c.as_str()),
+                captures.get(8).map(|c| c.as_str()),
+                captures.get(9).map(|c| c.as_str()),
+                captures.get(10).map(|c| c.as_str()),
+            ) {
                 Some(
-                    NaiveDateTime::parse_from_str(end_string, TIME_FORMAT).map_err(|err| {
-                        error!("error parsing end: {end_string:?}");
+                    datetime(end_year, end_month, end_day, end_hour, end_min).map_err(|err| {
+                        error!("error parsing end: {full:?}");
                         anyhow::anyhow!("error parsing end: {err}")
                     })?,
                 )
@@ -251,13 +286,13 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
                 None
             };
 
+            let duration_string = captures.get(11).map(|c| c.as_str());
+
             Ok(Clock {
                 parent: 0,
                 line: 0,
                 start,
                 end,
-                start_string,
-                end_string,
                 duration_string,
             })
         } else {
@@ -296,5 +331,13 @@ mod clock_tests {
         assert_eq!(result[1].start, expected_start);
         assert_eq!(result[1].end, None);
         assert_eq!(result[2].start, expected_start);
+    }
+
+    #[test]
+    fn test_parse_negative() {
+        let clock =
+            Clock::try_from("CLOCK: [2021-04-18 Sun 01:57]--[2021-04-18 Sun 00:47] =>  -1:10")
+                .expect("parse clock");
+        assert!(clock.matches_duration());
     }
 }
