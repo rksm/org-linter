@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::{prelude::*, Duration};
 use chrono_tz::Tz;
 use clap::Parser;
-use orgize::Org;
-use std::{borrow::Cow, ffi::OsString, fs, path::Path, str::FromStr};
+use org_processing::OrgFile;
+use std::{ffi::OsString, fs, path::Path, str::FromStr};
 
 #[derive(Parser)]
 #[command(about = "check your org files for stranger things")]
@@ -16,6 +16,8 @@ struct CheckOrgOptions {
     report_running_clock: bool,
     #[arg(long = "overlapping-clocks", default_value_t = true)]
     report_overlapping_clocks: bool,
+    #[arg(long = "negative-duration", default_value_t = true)]
+    report_negative_duration: bool,
     #[arg(value_parser = parse_duration_from_cli)]
     long_duration: Option<Duration>,
 }
@@ -101,6 +103,8 @@ const KNOWN_LONG_DURATIONS: &[KnownLongDuration] = &[
 ];
 
 fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+
     let opts = CheckOrgOptions::parse();
 
     let org_dir = std::env::home_dir().unwrap().join("org");
@@ -109,7 +113,6 @@ fn main() -> Result<()> {
         .into_iter()
         .filter_map(|file| {
             let file = file.ok()?;
-            // println!("{file:?}");
             if file.file_type().ok()?.is_file()
                 && file.path().extension() == Some(&OsString::from_str("org").ok()?)
             {
@@ -120,12 +123,10 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    // let file = "c:/Users/robert/org/coscreen.org";
-
     let parsed = org_files
         .iter()
-        .map(|file| fs::read_to_string(file).map(Org::parse_string))
-        .collect::<std::io::Result<Vec<_>>>()?;
+        .map(OrgFile::from_file)
+        .collect::<Result<Vec<_>>>()?;
 
     let mut clocks = if opts.report_overlapping_clocks {
         Some(Vec::new())
@@ -154,100 +155,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn check_org<'a>(
+fn check_org(
     file: impl AsRef<Path>,
-    org: &'a Org,
+    org: &OrgFile,
     opts: &CheckOrgOptions,
     clocks: &mut Option<Vec<(DateTime<Tz>, DateTime<Tz>, String, String)>>,
 ) {
     let file = file.as_ref();
     let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let mut current_title = None;
+    let doc = org.document();
+    let long_duration = opts.long_duration.unwrap_or_else(|| Duration::hours(10));
 
-    macro_rules! title {
-        () => {
-            if let Option::<&orgize::elements::Title>::Some(t) = &current_title {
-                &t.raw
-            } else {
-                &Cow::Borrowed("")
-            }
+    for clock in &doc.clocks {
+        let duration_string_raw = clock.duration_string.unwrap_or("");
+        let duration_string = clock.duration_formatted();
+        let title = doc.headlines[clock.parent].title;
+        let line = clock.line;
+
+        if opts.report_duration_mismatch && !clock.matches_duration() {
+            println!("[{file_name}:{line}] DURATION STRING DOES NOT MATCH: {title:?} ({duration_string_raw} vs {duration_string})");
         };
-    }
 
-    for x in org.iter() {
-        match x {
-            orgize::Event::Start(el) => {
-                match el {
-                    orgize::Element::Clock(clock) => match clock {
-                        orgize::elements::Clock::Closed {
-                            start,
-                            end,
-                            duration,
-                            ..
-                        } => {
-                            let (start, end) = start_end(start, end);
-                            let d = end - start;
-                            let actual_duration = duration_string(d);
-                            if let Some(clocks) = clocks {
-                                clocks.push((
-                                    start,
-                                    end,
-                                    file_name.to_string(),
-                                    title!().to_string(),
-                                ));
-                            }
-
-                            if opts.report_duration_mismatch && duration != &actual_duration {
-                                println!("[{file_name}] DURATION STRING DOES NOT MATCH: {:?} ({duration} vs {actual_duration})", title!());
-                            };
-
-                            if opts.report_long_duration {
-                                let long_duration =
-                                    opts.long_duration.unwrap_or_else(|| Duration::hours(10));
-                                if d > long_duration {
-                                    let allowed = KNOWN_LONG_DURATIONS.iter().any(|k| {
-                                        file_name == k.file
-                                            && current_title
-                                                .as_ref()
-                                                .map(|t| t.raw == k.title)
-                                                .unwrap_or(false)
-                                            && k.duration == duration
-                                    });
-                                    if !allowed {
-                                        println!(
-                                        "[{file_name}] LONG DURATION: {actual_duration} in {:?}",title!()
-                                    );
-                                    }
-                                }
-                            }
-                        }
-                        orgize::elements::Clock::Running { .. } => {
-                            if opts.report_running_clock {
-                                println!("[{file_name}] RUNNING CLOCK {:?}", title!());
-                            }
-                        }
-                    },
-                    orgize::Element::Title(title) => {
-                        current_title = Some(title);
-                    }
-
-                    _ => {}
-                };
+        if opts.report_long_duration && clock.duration() > long_duration {
+            let allowed = KNOWN_LONG_DURATIONS
+                .iter()
+                .any(|k| file_name == k.file && title == k.title && k.duration == duration_string);
+            if !allowed {
+                println!("[{file_name}:{line}] LONG DURATION: {duration_string} in {title:?}",);
             }
-            _ => {}
+        }
+
+        if opts.report_running_clock && clock.is_running() {
+            println!("[{file_name}:{line}] RUNNING CLOCK {title:?}");
+        }
+
+        if opts.report_negative_duration && clock.duration() < Duration::zero() {
+            println!("[{file_name}:{line}] NEGATIVE DURATION {title:?}: {duration_string}");
+        }
+
+        let Some(end) = &clock.end else {continue;};
+        let (start, end) = start_end(clock.start, *end);
+        if let Some(clocks) = clocks {
+            clocks.push((start, end, file_name.to_string(), title.to_string()));
         }
     }
 }
 
-fn start_end(
-    start: &orgize::elements::Datetime,
-    end: &orgize::elements::Datetime,
-) -> (DateTime<Tz>, DateTime<Tz>) {
-    let start: NaiveDateTime = start.into();
-    let end: NaiveDateTime = end.into();
-    if start > end {
-        eprintln!("start/end in wrong order?");
-    }
+fn start_end(start: NaiveDateTime, end: NaiveDateTime) -> (DateTime<Tz>, DateTime<Tz>) {
     let tz = if start
         < NaiveDateTime::parse_from_str("2019-05-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
     {
@@ -258,10 +212,4 @@ fn start_end(
     let start = start.and_local_timezone(tz).unwrap();
     let end = end.and_local_timezone(tz).unwrap();
     (start, end)
-}
-
-fn duration_string(d: Duration) -> String {
-    let hours = d.num_hours();
-    let minutes = d.num_minutes() - hours * 60;
-    format!("{hours}:{minutes:0>2}")
 }

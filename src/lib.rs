@@ -1,21 +1,37 @@
-use std::{path::PathBuf, str::Lines};
+#[macro_use]
+extern crate log;
 
 use anyhow::Result;
 use chrono::{prelude::*, Duration};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::path::{Path, PathBuf};
 
 // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
+#[derive(Debug)]
 pub struct OrgFile {
-    file_name: PathBuf,
+    file: PathBuf,
     content: String,
+}
+
+impl OrgFile {
+    pub fn from_file(file: impl AsRef<Path>) -> Result<Self> {
+        let file = file.as_ref().to_path_buf();
+        let content = std::fs::read_to_string(&file)?;
+        Ok(Self { file, content })
+    }
+
+    pub fn document(&self) -> OrgDocument {
+        info!("parsing file {:?}", self.file);
+        OrgDocument::parse(&self.content)
+    }
 }
 
 #[derive(Debug)]
 pub struct OrgDocument<'a> {
-    headlines: Vec<Headline<'a>>,
-    clocks: Vec<Clock<'a>>,
+    pub headlines: Vec<Headline<'a>>,
+    pub clocks: Vec<Clock<'a>>,
 }
 
 impl<'a> OrgDocument<'a> {
@@ -49,7 +65,7 @@ impl<'a> OrgDocument<'a> {
                     clock.parent = index;
                     if let Some(last_clock) = clocks.last() {
                         if last_clock.parent == index && last_clock.line != i - 1 {
-                            eprintln!(
+                            warn!(
                                 "WARNING: found clock on line {i}. Previous clock was on line {}",
                                 last_clock.line
                             );
@@ -57,7 +73,7 @@ impl<'a> OrgDocument<'a> {
                     }
                     clocks.push(clock);
                 } else {
-                    eprintln!("WARNING: found clock on line {i} but have no headline");
+                    warn!("WARNING: found clock on line {i} but have no headline");
                 }
                 continue;
             }
@@ -71,11 +87,11 @@ impl<'a> OrgDocument<'a> {
 
 #[derive(Debug)]
 pub struct Headline<'a> {
-    line: usize,
-    parent: usize,
-    level: usize,
-    title: &'a str,
-    tags_string: Option<&'a str>,
+    pub line: usize,
+    pub parent: usize,
+    pub level: usize,
+    pub title: &'a str,
+    pub tags_string: Option<&'a str>,
 }
 
 static HEADLINE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -150,16 +166,33 @@ mod headline_tests {
 
 #[derive(Debug, Clone)]
 pub struct Clock<'a> {
-    line: usize,
-    parent: usize,
+    pub line: usize,
+    pub parent: usize,
     start_string: &'a str,
     end_string: Option<&'a str>,
-    duration_string: Option<&'a str>,
-    start: NaiveDateTime,
-    end: Option<NaiveDateTime>,
+    pub duration_string: Option<&'a str>,
+    pub start: NaiveDateTime,
+    pub end: Option<NaiveDateTime>,
 }
 
 impl<'a> Clock<'a> {
+    pub fn is_running(&self) -> bool {
+        self.end.is_none()
+    }
+
+    pub fn duration(&self) -> Duration {
+        let Some(end) = self.end else {return Duration::zero()};
+        end - self.start
+    }
+
+    pub fn duration_formatted(&self) -> String {
+        let d = self.duration();
+        let negative = d < Duration::zero();
+        let hours = self.duration().num_hours().abs();
+        let minutes = self.duration().num_minutes().abs() - hours * 60;
+        format!("{}{hours}:{minutes:0>2}", if negative { "-" } else { "" })
+    }
+
     /// Does the specified duration matche start->end?
     pub fn matches_duration(&self) -> bool {
         let (Some(duration_string), Some(end)) = (self.duration_string, self.end) else {return false};
@@ -179,13 +212,13 @@ static CLOCK_RE: Lazy<Regex> = Lazy::new(|| {
 [\[<]                                             # < or [
 ([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[a-z]+\s+[0-9:]+)   # timestamp like [2022-12-12 Mon 19:49]
 [\]>]                                             # > or ]
-(?:--                                             # parse end timestamp
+(?:\s*--\s*                                       # parse end timestamp
 [\[<]
 ([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[a-z]+\s+[0-9:]+)
 [\]>]
 )?
 (?:\s*=>\s*                                       # parse duration
-([0-9]{1,2}:[0-9]{2})
+(-?[0-9]{1,2}:[0-9]{2})
 )?
 ",
     )
@@ -202,12 +235,17 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
             let start_string = &captures.get(1).unwrap().as_str();
             let end_string = captures.get(2).map(|m| m.as_str());
             let duration_string = captures.get(3).map(|m| m.as_str());
-            let start = NaiveDateTime::parse_from_str(start_string, TIME_FORMAT)
-                .map_err(|err| anyhow::anyhow!("error parsing start: {err}"))?;
+            let start =
+                NaiveDateTime::parse_from_str(start_string, TIME_FORMAT).map_err(|err| {
+                    error!("error parsing start: {start_string:?}");
+                    anyhow::anyhow!("error parsing start: {err}")
+                })?;
             let end = if let Some(end_string) = end_string {
                 Some(
-                    NaiveDateTime::parse_from_str(end_string, TIME_FORMAT)
-                        .map_err(|err| anyhow::anyhow!("error parsing end: {err}"))?,
+                    NaiveDateTime::parse_from_str(end_string, TIME_FORMAT).map_err(|err| {
+                        error!("error parsing end: {end_string:?}");
+                        anyhow::anyhow!("error parsing end: {err}")
+                    })?,
                 )
             } else {
                 None
