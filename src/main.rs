@@ -1,9 +1,8 @@
 use anyhow::Result;
-use chrono::{prelude::*, Duration};
-use chrono_tz::Tz;
+use chrono::Duration;
 use clap::Parser;
-use org_processing::OrgFile;
-use std::{ffi::OsString, fs, path::Path, str::FromStr};
+use org_processing::{Clock, OrgFile};
+use std::{ffi::OsString, fs, str::FromStr};
 
 #[derive(Parser)]
 #[command(about = "check your org files for stranger things")]
@@ -51,13 +50,13 @@ const KNOWN_LONG_DURATIONS: &[KnownLongDuration] = &[
     KnownLongDuration {file:"clockin.org", duration: "8:08", title: "blog post: setting up a Rust web / wasm project like it's 2022"},
 
     KnownLongDuration {file: "coscreen.org",duration: "9:30", title: "Create objective means to profile and determine end to end latency that users perceive when interacting with our user interface."},
-    KnownLongDuration {file: "coscreen.org",duration: "10:41", title: "implement messaging on top of electrons window messaging api"},
+    KnownLongDuration {file: "coscreen.org",duration: "10:41", title: "DONE implement messaging on top of electrons window messaging api"},
     KnownLongDuration {file: "coscreen.org",duration: "8:23", title: "mojave user gets extra \"coscreen helper\" permission request"},
     KnownLongDuration {file: "coscreen.org",duration: "9:18", title: "single window picking"},
     KnownLongDuration {file: "coscreen.org",duration: "8:04", title: "[node-wrtc] capture window content"},
     KnownLongDuration {file: "coscreen.org",duration: "9:48", title: "[node-wrtc] capture window content"},
     KnownLongDuration {file: "coscreen.org",duration: "9:44", title: "i420 yuv conversion"},
-    KnownLongDuration {file: "coscreen.org",duration: "11:29", title: "ACTIVE profiling support for coscreen native :remote-control:windows:"},
+    KnownLongDuration {file: "coscreen.org",duration: "11:29", title: "ACTIVE profiling support for coscreen native"},
     KnownLongDuration {file: "coscreen.org",duration: "11:47", title: "Learning about GTK & libwebrtc screen capturing"},
     KnownLongDuration {file: "coscreen.org",duration: "8:13", title: "sending libwebrtc screen capture to browser"},
     KnownLongDuration {file: "coscreen.org",duration: "14:36", title: "testing native client with rust"},
@@ -123,6 +122,13 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
+    // let org_files = vec![std::path::PathBuf::from("/Users/robert/org/clockin.org")];
+
+    let file_names = org_files
+        .iter()
+        .map(|f| f.to_string_lossy())
+        .collect::<Vec<_>>();
+
     let parsed = org_files
         .iter()
         .map(OrgFile::from_file)
@@ -134,19 +140,19 @@ fn main() -> Result<()> {
         None
     };
 
-    for (file, org) in org_files.iter().zip(&parsed) {
+    for (file, org) in file_names.iter().zip(&parsed) {
         check_org(file, org, &opts, &mut clocks);
     }
 
     if let Some(clocks) = clocks {
-        for (i, (start, end, file, title)) in clocks.iter().enumerate() {
-            for (j, (start2, end2, file2, title2)) in clocks.iter().enumerate() {
-                if i != j {
-                    if start2 > start && start2 < end {
-                        println!("OVERLAPPING TIME");
-                        println!("  [{start}-{end}] {file:?} {title:?}");
-                        println!("  [{start2}-{end2}] {file2:?} {title2:?}");
-                    }
+        for (i, (file1, title1, clock1)) in clocks.iter().enumerate() {
+            for (j, (file2, title2, clock2)) in clocks.iter().enumerate() {
+                if i != j && clock1.overlaps(clock2) {
+                    let line1 = clock1.line;
+                    let line2 = clock2.line;
+                    println!("OVERLAPPING TIME");
+                    println!("  {clock1} {title1:?} {file1}:{line1}");
+                    println!("  {clock2} {title2:?} {file2}:{line2}");
                 }
             }
         }
@@ -155,14 +161,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn check_org(
-    file: impl AsRef<Path>,
-    org: &OrgFile,
+fn check_org<'a, 'b>(
+    file_name: &'a str,
+    org: &'b OrgFile,
     opts: &CheckOrgOptions,
-    clocks: &mut Option<Vec<(DateTime<Tz>, DateTime<Tz>, String, String)>>,
+    clocks: &mut Option<Vec<(&'a str, &'b str, Clock<'b>)>>,
 ) {
-    let file = file.as_ref();
-    let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let doc = org.document();
     let long_duration = opts.long_duration.unwrap_or_else(|| Duration::hours(10));
 
@@ -177,9 +181,9 @@ fn check_org(
         };
 
         if opts.report_long_duration && clock.duration() > long_duration {
-            let allowed = KNOWN_LONG_DURATIONS
-                .iter()
-                .any(|k| file_name == k.file && title == k.title && k.duration == duration_string);
+            let allowed = KNOWN_LONG_DURATIONS.iter().any(|k| {
+                file_name.ends_with(k.file) && title == k.title && k.duration == duration_string
+            });
             if !allowed {
                 println!("[{file_name}:{line}] LONG DURATION: {duration_string} in {title:?}",);
             }
@@ -193,23 +197,8 @@ fn check_org(
             println!("[{file_name}:{line}] NEGATIVE DURATION {title:?}: {duration_string}");
         }
 
-        let Some(end) = &clock.end else {continue;};
-        let (start, end) = start_end(clock.start, *end);
         if let Some(clocks) = clocks {
-            clocks.push((start, end, file_name.to_string(), title.to_string()));
+            clocks.push((file_name, title, clock.clone()));
         }
     }
-}
-
-fn start_end(start: NaiveDateTime, end: NaiveDateTime) -> (DateTime<Tz>, DateTime<Tz>) {
-    let tz = if start
-        < NaiveDateTime::parse_from_str("2019-05-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
-    {
-        chrono_tz::US::Pacific
-    } else {
-        chrono_tz::Europe::Berlin
-    };
-    let start = start.and_local_timezone(tz).unwrap();
-    let end = end.and_local_timezone(tz).unwrap();
-    (start, end)
 }
