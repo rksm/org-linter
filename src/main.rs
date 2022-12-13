@@ -139,6 +139,7 @@ fn main() -> Result<()> {
     let docs = org_files.iter().map(|ea| ea.document()).collect::<Vec<_>>();
 
     // check docs
+    println!("checking org files...");
     for doc in &docs {
         check_org(doc, &opts);
     }

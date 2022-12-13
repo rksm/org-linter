@@ -89,13 +89,14 @@ impl<'a> Clock<'a> {
         if self.is_running() {
             return true;
         }
-        let (Some(duration_string), Some(end)) = (self.duration_string, self.end) else {return false};
-        let Some((h, m)) = duration_string.split_once(':') else {return false};
+        let Some(duration_string) = self.duration_string else { return false };
+        let Some((h, m)) = duration_string.split_once(':') else { return false };
         let negative = h.starts_with('-');
         let parsed = Duration::hours(i64::abs(h.parse().unwrap_or(0)))
             + Duration::minutes(m.parse().unwrap_or(0));
         let parsed = if negative { -parsed } else { parsed };
-        let actual = end - self.start;
+        let (start, end) = start_end(self.start, self.end);
+        let actual = end - start;
         parsed == actual
     }
 
