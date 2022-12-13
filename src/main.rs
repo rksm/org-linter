@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Duration;
 use clap::Parser;
-use org_processing::{Clock, OrgFile};
-use std::{ffi::OsString, fs, str::FromStr};
+use org_processing::{Clock, ClockConflict, FileChange, Headline, OrgDocument, OrgFile};
+use std::{collections::HashSet, ffi::OsString, fs, path::PathBuf, str::FromStr};
 
 #[derive(Parser)]
 #[command(about = "check your org files for stranger things")]
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
 
     let org_dir = std::env::home_dir().unwrap().join("org");
 
-    let org_files = fs::read_dir(org_dir)?
+    let files = fs::read_dir(&org_dir)?
         .into_iter()
         .filter_map(|file| {
             let file = file.ok()?;
@@ -123,57 +123,39 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     // let org_files = vec![std::path::PathBuf::from("/Users/robert/org/clockin.org")];
+    let files = vec![org_dir.join("test.org")];
 
-    let file_names = org_files
-        .iter()
-        .map(|f| f.to_string_lossy())
-        .collect::<Vec<_>>();
-
-    let parsed = org_files
+    let org_files = files
         .iter()
         .map(OrgFile::from_file)
         .collect::<Result<Vec<_>>>()?;
 
-    let mut clocks = if opts.report_overlapping_clocks {
-        Some(Vec::new())
-    } else {
-        None
-    };
+    let docs = org_files.iter().map(|ea| ea.document()).collect::<Vec<_>>();
 
-    for (file, org) in file_names.iter().zip(&parsed) {
-        check_org(file, org, &opts, &mut clocks);
+    // check docs
+    for doc in &docs {
+        check_org(doc, &opts);
     }
 
-    if let Some(clocks) = clocks {
-        for (i, (file1, title1, clock1)) in clocks.iter().enumerate() {
-            for (j, (file2, title2, clock2)) in clocks.iter().enumerate() {
-                if i != j && clock1.overlaps(clock2) {
-                    let line1 = clock1.line;
-                    let line2 = clock2.line;
-                    println!("OVERLAPPING TIME");
-                    println!("  {clock1} {title1:?} {file1}:{line1}");
-                    println!("  {clock2} {title2:?} {file2}:{line2}");
-                }
-            }
-        }
+    // clock conflicts
+    for conflict in ClockConflict::find_conflicts(&docs) {
+        conflict.report();
+        let changes = conflict.resolve();
+        FileChange::apply(changes)?;
     }
 
     Ok(())
 }
 
-fn check_org<'a, 'b>(
-    file_name: &'a str,
-    org: &'b OrgFile,
-    opts: &CheckOrgOptions,
-    clocks: &mut Option<Vec<(&'a str, &'b str, Clock<'b>)>>,
-) {
-    let doc = org.document();
+fn check_org(doc: &OrgDocument, opts: &CheckOrgOptions) {
+    let file_name = doc.file_name();
     let long_duration = opts.long_duration.unwrap_or_else(|| Duration::hours(10));
 
     for clock in &doc.clocks {
         let duration_string_raw = clock.duration_string.unwrap_or("");
         let duration_string = clock.duration_formatted();
-        let title = doc.headlines[clock.parent].title;
+        let headline = &doc.headlines[clock.parent];
+        let title = headline.title;
         let line = clock.line;
 
         if opts.report_duration_mismatch && !clock.matches_duration() {
@@ -195,10 +177,6 @@ fn check_org<'a, 'b>(
 
         if opts.report_negative_duration && clock.duration() < Duration::zero() {
             println!("[{file_name}:{line}] NEGATIVE DURATION {title:?}: {duration_string}");
-        }
-
-        if let Some(clocks) = clocks {
-            clocks.push((file_name, title, clock.clone()));
         }
     }
 }

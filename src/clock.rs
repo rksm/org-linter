@@ -3,22 +3,61 @@ use chrono_tz::Tz;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum TimestampType {
+    Active,
+    Inactive,
+}
+
+impl TimestampType {
+    fn open(&self) -> char {
+        match self {
+            TimestampType::Active => '<',
+            TimestampType::Inactive => '[',
+        }
+    }
+
+    fn close(&self) -> char {
+        match self {
+            TimestampType::Active => '>',
+            TimestampType::Inactive => ']',
+        }
+    }
+}
+
+impl From<char> for TimestampType {
+    fn from(c: char) -> Self {
+        if c == '<' {
+            Self::Active
+        } else {
+            Self::Inactive
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Clock<'a> {
     pub line: usize,
     pub parent: usize,
     pub duration_string: Option<&'a str>,
     pub start: NaiveDateTime,
     pub end: Option<NaiveDateTime>,
+    pub timestamp_type: TimestampType,
 }
 
 impl<'a> std::fmt::Display for Clock<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.start.format("%Y-%m-%d %a %H:%M"))?;
+        let type_open = self.timestamp_type.open();
+        let type_close = self.timestamp_type.close();
+        write!(
+            f,
+            "{type_open}{}{type_close}",
+            self.start.format("%Y-%m-%d %a %H:%M")
+        )?;
         if let Some(end) = self.end {
             write!(
                 f,
-                "--{} => {}",
+                "--{type_open}{}{type_close} => {:>5}",
                 end.format("%Y-%m-%d %a %H:%M"),
                 self.duration_formatted()
             )?;
@@ -99,7 +138,7 @@ pub(crate) static CLOCK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?ix)
 \s*clock:\s*                                      # CLOCK:
-[\[<]                                             # < or [
+([\[<])                                           # < or [ timestamp type
 ([0-9]{4})-([0-9]{2})-([0-9]{2})                  # yyyy-mm-dd
 \s+[a-z]+\s+                                      # day of week (can be localized)
 ([0-9]{2}):([0-9]{2})                             # HH:MM
@@ -148,12 +187,21 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
 
             let full = captures.get(0).unwrap().as_str();
 
+            let timestamp_type = captures
+                .get(1)
+                .unwrap()
+                .as_str()
+                .chars()
+                .next()
+                .unwrap()
+                .into();
+
             let start = datetime(
-                captures.get(1).unwrap().as_str(),
                 captures.get(2).unwrap().as_str(),
                 captures.get(3).unwrap().as_str(),
                 captures.get(4).unwrap().as_str(),
                 captures.get(5).unwrap().as_str(),
+                captures.get(6).unwrap().as_str(),
             )
             .map_err(|err| {
                 error!("error parsing start: {full:?}");
@@ -167,11 +215,11 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
                 Some(end_hour),
                 Some(end_min),
             ) = (
-                captures.get(6).map(|c| c.as_str()),
                 captures.get(7).map(|c| c.as_str()),
                 captures.get(8).map(|c| c.as_str()),
                 captures.get(9).map(|c| c.as_str()),
                 captures.get(10).map(|c| c.as_str()),
+                captures.get(11).map(|c| c.as_str()),
             ) {
                 Some(
                     datetime(end_year, end_month, end_day, end_hour, end_min).map_err(|err| {
@@ -183,7 +231,7 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
                 None
             };
 
-            let duration_string = captures.get(11).map(|c| c.as_str());
+            let duration_string = captures.get(12).map(|c| c.as_str());
 
             Ok(Clock {
                 parent: 0,
@@ -191,6 +239,7 @@ impl<'a> TryFrom<&'a str> for Clock<'a> {
                 start,
                 end,
                 duration_string,
+                timestamp_type,
             })
         } else {
             Err(anyhow::anyhow!("unable to parse as clock: {s:?}"))

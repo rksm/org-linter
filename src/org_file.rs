@@ -18,6 +18,6 @@ impl OrgFile {
 
     pub fn document(&self) -> OrgDocument {
         trace!("parsing file {:?}", self.file);
-        OrgDocument::parse(&self.content)
+        OrgDocument::parse(&self.file, &self.content)
     }
 }

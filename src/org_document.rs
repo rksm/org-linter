@@ -1,15 +1,18 @@
+use std::path::PathBuf;
+
 use crate::block::Block;
 use crate::clock::Clock;
 use crate::headline::Headline;
 
 #[derive(Debug)]
 pub struct OrgDocument<'a> {
+    pub file: PathBuf,
     pub headlines: Vec<Headline<'a>>,
     pub clocks: Vec<Clock<'a>>,
 }
 
 impl<'a> OrgDocument<'a> {
-    pub fn parse(content: &'a str) -> Self {
+    pub fn parse(file: impl Into<PathBuf>, content: &'a str) -> Self {
         let mut headlines = Vec::new();
         let mut clocks: Vec<Clock> = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
@@ -70,6 +73,15 @@ impl<'a> OrgDocument<'a> {
                 continue;
             }
         }
-        Self { headlines, clocks }
+
+        Self {
+            file: file.into(),
+            headlines,
+            clocks,
+        }
+    }
+
+    pub fn file_name(&self) -> &str {
+        self.file.file_name().and_then(|f| f.to_str()).unwrap_or("")
     }
 }

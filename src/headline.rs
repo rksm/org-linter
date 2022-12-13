@@ -2,13 +2,23 @@ use anyhow::Result;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Headline<'a> {
     pub line: usize,
     pub parent: usize,
     pub level: usize,
     pub title: &'a str,
     pub tags_string: Option<&'a str>,
+}
+
+impl<'a> std::fmt::Display for Headline<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", "*".repeat(self.level), self.title)?;
+        if let Some(tags_string) = self.tags_string {
+            write!(f, " {}", tags_string)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) static HEADLINE_RE: Lazy<Regex> = Lazy::new(|| {
