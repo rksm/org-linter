@@ -15,6 +15,20 @@ pub enum ConflictResolution {
     SplitContaining,
     RemoveInner,
     Auto,
+    Skip,
+}
+
+impl ConflictResolution {
+    pub fn explanation(&self) -> &'static str {
+        match self {
+            Self::ShrinkEarlier => "Shrink earlier timestamp",
+            Self::ShrinkLater => "Shrink later timestamp",
+            Self::SplitContaining => "Split the outer timestamp",
+            Self::RemoveInner => "Remove the inner timestamp",
+            Self::Auto => "Merge timestamps",
+            Self::Skip => "Skip",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -66,7 +80,9 @@ impl<'a> std::hash::Hash for ClockConflict<'a> {
 }
 
 impl<'a> ClockConflict<'a> {
-    pub fn find_conflicts(org_docs: &'a [OrgDocument<'a>]) -> Vec<Self> {
+    pub fn find_conflicts(
+        org_docs: &'a [OrgDocument<'a>],
+    ) -> impl Iterator<Item = ClockConflict<'a>> + 'a {
         let mut clocks = Vec::new();
 
         for doc in org_docs {
@@ -76,28 +92,15 @@ impl<'a> ClockConflict<'a> {
             }
         }
 
-        let mut conflicts = HashSet::new();
-
-        for (i, (file1, headline1, clock1)) in clocks.iter().enumerate() {
-            for (j, (file2, headline2, clock2)) in clocks.iter().enumerate() {
-                if i != j && clock1.overlaps(clock2) {
-                    let conflict = Self {
-                        clock1,
-                        clock2,
-                        headline1,
-                        headline2,
-                        file1,
-                        file2,
-                    };
-                    conflicts.insert(conflict);
-                }
-            }
+        ClockConflictIterator {
+            data: clocks,
+            last_i: 0,
+            last_j: 0,
+            seen: Default::default(),
         }
-
-        conflicts.into_iter().collect()
     }
 
-    pub fn report(&self) {
+    pub fn report(&self) -> String {
         let Self {
             clock1,
             clock2,
@@ -110,9 +113,17 @@ impl<'a> ClockConflict<'a> {
         let line2 = clock2.line;
         let title1 = headline1.title;
         let title2 = headline2.title;
-        println!("OVERLAPPING TIME");
-        println!("  {clock1} {title1:?} {}:{line1}", file1.display());
-        println!("  {clock2} {title2:?} {}:{line2}", file2.display());
+        format!(
+            "OVERLAPPING TIME\n  {clock1} {title1:?} {}:{line1}\n  {clock2} {title2:?} {}:{line2}",
+            file1.display(),
+            file2.display()
+        )
+    }
+
+    pub fn hashme(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn resolution_options(&self) -> Vec<ConflictResolution> {
@@ -128,7 +139,7 @@ impl<'a> ClockConflict<'a> {
         } = self;
 
         if file1 == file2 && headline1.line == headline2.line {
-            return vec![Auto];
+            return vec![Auto, Skip];
         }
 
         let (earlier, later) = if clock1.start <= clock2.start {
@@ -139,13 +150,17 @@ impl<'a> ClockConflict<'a> {
 
         // intervals are not contained
         if earlier.end < later.end {
-            return vec![ShrinkEarlier, ShrinkLater];
+            return vec![ShrinkEarlier, ShrinkLater, Skip];
         }
 
-        vec![RemoveInner, SplitContaining]
+        vec![RemoveInner, SplitContaining, Skip]
     }
 
     pub fn resolve(self, resolution: ConflictResolution) -> Vec<FileChange<'a>> {
+        if matches!(resolution, ConflictResolution::Skip) {
+            return Default::default();
+        }
+
         let Self {
             clock1,
             clock2,
@@ -266,11 +281,6 @@ impl<'a> FileChange<'a> {
         }
     }
 
-    #[inline]
-    fn is_add(&self) -> bool {
-        matches!(self, FileChange::AddedClock { .. })
-    }
-
     pub fn fixup_headline<'b>(&self, headline: &mut Headline<'b>) {
         if headline.line < self.line() {
             return;
@@ -386,6 +396,52 @@ impl<'a> FileChange<'a> {
     }
 }
 
+struct ClockConflictIterator<'a> {
+    data: Vec<(&'a PathBuf, &'a Headline<'a>, &'a Clock<'a>)>,
+    last_i: usize,
+    last_j: usize,
+    seen: HashSet<u64>,
+}
+
+impl<'a> Iterator for ClockConflictIterator<'a> {
+    type Item = ClockConflict<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (i, (file1, headline1, clock1)) in self.data.iter().enumerate() {
+            if i < self.last_i {
+                continue;
+            }
+            for (j, (file2, headline2, clock2)) in self.data.iter().enumerate() {
+                if i == self.last_i && j < self.last_j {
+                    continue;
+                }
+                if i != j && clock1.overlaps(clock2) {
+                    let conflict = ClockConflict {
+                        clock1,
+                        clock2,
+                        headline1,
+                        headline2,
+                        file1,
+                        file2,
+                    };
+
+                    // Don't report duplicates when finding reversed pair
+                    let hash = conflict.hashme();
+                    if self.seen.contains(&hash) {
+                        continue;
+                    }
+
+                    self.last_i = i;
+                    self.last_j = j;
+                    self.seen.insert(hash);
+                    return Some(conflict);
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -401,11 +457,14 @@ CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:50] =>  0:10
 ";
 
         let docs = &[OrgDocument::parse(PathBuf::from("test.org"), org_string)];
-        let mut conflicts = ClockConflict::find_conflicts(docs);
-        assert_eq!(conflicts.len(), 1);
+        let conflicts = ClockConflict::find_conflicts(docs);
+        assert_eq!(conflicts.count(), 1);
 
         let result = FileChange::apply_to_string(
-            conflicts.remove(0).resolve(ConflictResolution::Auto),
+            ClockConflict::find_conflicts(docs)
+                .next()
+                .unwrap()
+                .resolve(ConflictResolution::Auto),
             org_string,
         )
         .expect("apply changes");

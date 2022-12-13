@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Duration;
 use clap::Parser;
-use org_processing::{ClockConflict, OrgDocument, OrgFile};
-use std::{ffi::OsString, fs, str::FromStr};
+use org_processing::{ClockConflict, FileChange, OrgDocument, OrgFile};
+use std::{collections::HashSet, ffi::OsString, fs, io::BufRead, str::FromStr};
 
 #[derive(Parser)]
 #[command(about = "check your org files for stranger things")]
@@ -17,6 +17,12 @@ struct CheckOrgOptions {
     report_overlapping_clocks: bool,
     #[arg(long = "negative-duration", default_value_t = true)]
     report_negative_duration: bool,
+    #[arg(long = "zero-clocks", default_value_t = true)]
+    report_zero_clocks: bool,
+    #[arg(long = "clock-conflicts", default_value_t = true)]
+    report_clock_conflicts: bool,
+    #[arg(long = "fix-clock-conflicts", default_value_t = false)]
+    fix_clock_conflicts: bool,
     #[arg(value_parser = parse_duration_from_cli)]
     long_duration: Option<Duration>,
 }
@@ -97,8 +103,7 @@ const KNOWN_LONG_DURATIONS: &[KnownLongDuration] = &[
     KnownLongDuration {file: "projects.org", duration: "10:26", title: "lynn datenauswertung"},
     KnownLongDuration {file: "projects.org", duration: "10:21", title: "playing around with lisp twitter api via chirp / common lisp"},
     KnownLongDuration {file: "projects.org", duration: "10:57", title: "[[file:~/projects/rust/fritz-homeautomation][fritz rust app]]"},
-    KnownLongDuration {file: "projects.org", duration: "11:30", title: "[[file:~/projects/rust/homeautomation][homeautomation framework]]"},
-    KnownLongDuration {file: "projects.org", duration: "9:19", title: "[[file:~/projects/rust/homeautomation][homeautomation framework]]"},
+    KnownLongDuration {file: "projects.org", duration: "12:49", title: "[[file:~/projects/rust/homeautomation][homeautomation framework]]"},
 ];
 
 fn main() -> Result<()> {
@@ -106,6 +111,7 @@ fn main() -> Result<()> {
 
     let opts = CheckOrgOptions::parse();
 
+    #[allow(deprecated)]
     let org_dir = std::env::home_dir().unwrap().join("org");
 
     let files = fs::read_dir(&org_dir)?
@@ -138,10 +144,59 @@ fn main() -> Result<()> {
     }
 
     // clock conflicts
-    for conflict in ClockConflict::find_conflicts(&docs) {
-        conflict.report();
-        // let changes = conflict.resolve();
-        // FileChange::apply(changes)?;
+
+    if opts.report_clock_conflicts {
+        println!("finding clock conflicts...");
+        for conflict in ClockConflict::find_conflicts(&docs) {
+            println!("{}", conflict.report());
+        }
+    } else if opts.fix_clock_conflicts {
+        let mut skipped = HashSet::new();
+        'outer: loop {
+            let org_files = files
+                .iter()
+                .map(OrgFile::from_file)
+                .collect::<Result<Vec<_>>>()?;
+            let docs = org_files.iter().map(|ea| ea.document()).collect::<Vec<_>>();
+            for conflict in ClockConflict::find_conflicts(&docs) {
+                let hash = conflict.hashme();
+                if skipped.contains(&hash) {
+                    continue;
+                }
+                println!("{}", conflict.report());
+                let resolutions = conflict.resolution_options();
+                let options = resolutions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, resolution)| (i, resolution.explanation()))
+                    .collect::<Vec<_>>();
+
+                println!("Select resolution:");
+
+                for (i, expl) in options {
+                    println!("  {i}) {expl}");
+                }
+                let mut stdin = std::io::stdin().lock();
+                let selected = loop {
+                    let mut input = String::new();
+                    stdin.read_line(&mut input).expect("readline");
+                    match input.trim().parse::<usize>() {
+                        Ok(i) if i < resolutions.len() => break i,
+                        _ => println!("invalid input"),
+                    };
+                };
+                let resolution = resolutions.get(selected).expect("get resolution");
+                let changes = conflict.resolve(*resolution);
+                if !changes.is_empty() {
+                    FileChange::apply(changes)?;
+                    continue 'outer;
+                } else {
+                    skipped.insert(hash);
+                }
+            }
+
+            break;
+        }
     }
 
     Ok(())
@@ -177,6 +232,10 @@ fn check_org(doc: &OrgDocument, opts: &CheckOrgOptions) {
 
         if opts.report_negative_duration && clock.duration() < Duration::zero() {
             println!("[{file_name}:{line}] NEGATIVE DURATION {title:?}: {duration_string}");
+        }
+
+        if opts.report_zero_clocks && clock.duration() == Duration::zero() && !clock.is_running() {
+            println!("[{file_name}:{line}] ZERO DURATION {title:?}: {duration_string}");
         }
     }
 }
