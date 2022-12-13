@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::{hash_map::DefaultHasher, HashSet},
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -7,7 +8,16 @@ use std::{
 
 use crate::{Clock, Headline, OrgDocument};
 
-#[derive(Debug, Eq)]
+#[derive(Debug, Clone, Copy)]
+pub enum ConflictResolution {
+    ShrinkEarlier,
+    ShrinkLater,
+    SplitContaining,
+    RemoveInner,
+    Auto,
+}
+
+#[derive(Clone, Debug, Eq)]
 pub struct ClockConflict<'a> {
     clock1: &'a Clock<'a>,
     clock2: &'a Clock<'a>,
@@ -105,7 +115,37 @@ impl<'a> ClockConflict<'a> {
         println!("  {clock2} {title2:?} {}:{line2}", file2.display());
     }
 
-    pub fn resolve(self) -> Vec<FileChange<'a>> {
+    pub fn resolution_options(&self) -> Vec<ConflictResolution> {
+        use ConflictResolution::*;
+
+        let Self {
+            clock1,
+            clock2,
+            headline1,
+            headline2,
+            file1,
+            file2,
+        } = self;
+
+        if file1 == file2 && headline1.line == headline2.line {
+            return vec![Auto];
+        }
+
+        let (earlier, later) = if clock1.start <= clock2.start {
+            (clock1, clock2)
+        } else {
+            (clock2, clock1)
+        };
+
+        // intervals are not contained
+        if earlier.end < later.end {
+            return vec![ShrinkEarlier, ShrinkLater];
+        }
+
+        vec![RemoveInner, SplitContaining]
+    }
+
+    pub fn resolve(self, resolution: ConflictResolution) -> Vec<FileChange<'a>> {
         let Self {
             clock1,
             clock2,
@@ -126,12 +166,49 @@ impl<'a> ClockConflict<'a> {
             keep_clock.start = keep_clock.start.min(delete_clock.start);
             keep_clock.end = keep_clock.end.max(delete_clock.end);
             return vec![
-                FileChange::delete(file2, delete_clock),
                 FileChange::update(file1, keep_clock),
+                FileChange::delete(file2, delete_clock),
             ];
         }
 
-        todo!()
+        let (mut earlier, earlier_file, mut later, later_file) = if clock1.start <= clock2.start {
+            (clock1, file1, clock2, file2)
+        } else {
+            (clock2, file2, clock1, file1)
+        };
+
+        // intervals are not contained
+        if earlier.end < later.end {
+            return match resolution {
+                ConflictResolution::ShrinkEarlier => {
+                    earlier.end = Some(later.start);
+                    vec![FileChange::update(earlier_file, earlier)]
+                }
+                ConflictResolution::ShrinkLater => {
+                    later.start = earlier.end.unwrap();
+                    vec![FileChange::update(later_file, later)]
+                }
+                _ => panic!("invalid resolution {resolution:?}"),
+            };
+        }
+
+        // earlier contains "later" interval
+        match resolution {
+            ConflictResolution::SplitContaining => {
+                let mut third = earlier.clone();
+                // third.line += 1;
+                third.start = later.end.unwrap();
+                earlier.end = Some(later.start);
+                vec![
+                    FileChange::update(earlier_file, earlier),
+                    FileChange::add(earlier_file, third),
+                ]
+            }
+            ConflictResolution::RemoveInner => {
+                vec![FileChange::delete(later_file, later)]
+            }
+            _ => panic!("invalid resolution {resolution:?}"),
+        }
     }
 }
 
@@ -187,6 +264,11 @@ impl<'a> FileChange<'a> {
             FileChange::AddedClock { file, .. } => file,
             FileChange::UpdateClock { file, .. } => file,
         }
+    }
+
+    #[inline]
+    fn is_add(&self) -> bool {
+        matches!(self, FileChange::AddedClock { .. })
     }
 
     pub fn fixup_headline<'b>(&self, headline: &mut Headline<'b>) {
@@ -256,7 +338,23 @@ impl<'a> FileChange<'a> {
         }
 
         // order from largest line no to smallest so we can apply in order without fixups
-        changes.sort_by_key(|c| c.line());
+        changes.sort_by(|a, b| {
+            use Ordering::*;
+            let line1 = a.line();
+            let line2 = b.line();
+            if line1 < line2 {
+                return Less;
+            }
+            if line1 > line2 {
+                return Greater;
+            }
+            match (a, b) {
+                (FileChange::AddedClock { .. }, FileChange::AddedClock { .. }) => Equal,
+                (FileChange::AddedClock { .. }, _) => Less,
+                (_, FileChange::AddedClock { .. }) => Greater,
+                _ => Equal,
+            }
+        });
         changes.reverse();
 
         let file = changes[0].file().clone();
@@ -292,30 +390,93 @@ impl<'a> FileChange<'a> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{ClockConflict, FileChange, OrgDocument};
+    use crate::{clock_conflict::ConflictResolution, ClockConflict, FileChange, OrgDocument};
 
     #[test]
-    fn resolve_conflict() {
+    fn resolve_conflict_by_joining_times() {
         let org_string = "
 * fooo
-:LOGBOOK:
 CLOCK: [2022-12-12 Mon 10:45]--[2022-12-12 Mon 10:55] =>  0:10
 CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:50] =>  0:10
-:END:
 ";
 
-        let doc = OrgDocument::parse(PathBuf::from("test.org"), org_string);
-        let docs = &[doc];
+        let docs = &[OrgDocument::parse(PathBuf::from("test.org"), org_string)];
         let mut conflicts = ClockConflict::find_conflicts(docs);
         assert_eq!(conflicts.len(), 1);
 
-        let result = FileChange::apply_to_string(conflicts.remove(0).resolve(), org_string)
-            .expect("apply changes");
+        let result = FileChange::apply_to_string(
+            conflicts.remove(0).resolve(ConflictResolution::Auto),
+            org_string,
+        )
+        .expect("apply changes");
         let expected = "
 * fooo
-:LOGBOOK:
 CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:55] =>  0:15
-:END:
+";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_conflict_by_adjusting_time() {
+        let org_string = "
+* fooo
+CLOCK: [2022-12-12 Mon 10:45]--[2022-12-12 Mon 10:55] =>  0:10
+* bar
+CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:50] =>  0:10
+";
+
+        let docs = &[OrgDocument::parse(PathBuf::from("test.org"), org_string)];
+        let conflict = ClockConflict::find_conflicts(docs)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let changes = conflict.clone().resolve(ConflictResolution::ShrinkEarlier);
+        let result = FileChange::apply_to_string(changes, org_string).expect("apply changes");
+        let expected = "
+* fooo
+CLOCK: [2022-12-12 Mon 10:45]--[2022-12-12 Mon 10:55] =>  0:10
+* bar
+CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:45] =>  0:05
+";
+        assert_eq!(result, expected);
+
+        let changes = conflict.resolve(ConflictResolution::ShrinkLater);
+        let result = FileChange::apply_to_string(changes, org_string).expect("apply changes");
+        let expected = "
+* fooo
+CLOCK: [2022-12-12 Mon 10:50]--[2022-12-12 Mon 10:55] =>  0:05
+* bar
+CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:50] =>  0:10
+";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_conflict_by_splitting() {
+        let org_string = "
+* fooo
+CLOCK: [2022-12-12 Mon 10:45]--[2022-12-12 Mon 10:55] =>  0:10
+* bar
+CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:59] =>  0:10
+";
+
+        let docs = &[OrgDocument::parse(PathBuf::from("test.org"), org_string)];
+        let conflict = ClockConflict::find_conflicts(docs)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let changes = conflict
+            .clone()
+            .resolve(ConflictResolution::SplitContaining);
+        let result = FileChange::apply_to_string(changes, org_string).expect("apply changes");
+        let expected = "
+* fooo
+CLOCK: [2022-12-12 Mon 10:45]--[2022-12-12 Mon 10:55] =>  0:10
+* bar
+CLOCK: [2022-12-12 Mon 10:55]--[2022-12-12 Mon 10:59] =>  0:04
+CLOCK: [2022-12-12 Mon 10:40]--[2022-12-12 Mon 10:45] =>  0:05
 ";
         assert_eq!(result, expected);
     }

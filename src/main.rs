@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Duration;
 use clap::Parser;
-use org_processing::{Clock, ClockConflict, FileChange, Headline, OrgDocument, OrgFile};
-use std::{collections::HashSet, ffi::OsString, fs, path::PathBuf, str::FromStr};
+use org_processing::{ClockConflict, OrgDocument, OrgFile};
+use std::{ffi::OsString, fs, str::FromStr};
 
 #[derive(Parser)]
 #[command(about = "check your org files for stranger things")]
@@ -122,8 +122,8 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    // let org_files = vec![std::path::PathBuf::from("/Users/robert/org/clockin.org")];
-    let files = vec![org_dir.join("test.org")];
+    // let files = vec![std::path::PathBuf::from("/Users/robert/org/clockin.org")];
+    // let files = vec![org_dir.join("test.org")];
 
     let org_files = files
         .iter()
@@ -140,8 +140,8 @@ fn main() -> Result<()> {
     // clock conflicts
     for conflict in ClockConflict::find_conflicts(&docs) {
         conflict.report();
-        let changes = conflict.resolve();
-        FileChange::apply(changes)?;
+        // let changes = conflict.resolve();
+        // FileChange::apply(changes)?;
     }
 
     Ok(())
