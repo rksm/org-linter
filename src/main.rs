@@ -1,30 +1,104 @@
 use anyhow::Result;
 use chrono::Duration;
 use clap::Parser;
-use org_processing::{ClockConflict, FileChange, OrgDocument, OrgFile};
-use std::{collections::HashSet, ffi::OsString, fs, io::BufRead, str::FromStr};
+use once_cell::sync::Lazy;
+use org_linter::{ClockConflict, FileChange, OrgDocument, OrgFile};
+use std::{collections::HashSet, ffi::OsString, fs, io::BufRead, path::PathBuf, str::FromStr};
+
+static DEFAULT_ORG_DIR: Lazy<String> = Lazy::new(|| {
+    #[allow(deprecated)]
+    std::env::home_dir()
+        .unwrap()
+        .join("org")
+        .to_string_lossy()
+        .to_string()
+});
 
 #[derive(Parser)]
-#[command(about = "check your org files for stranger things")]
+#[command(
+    about = "Checks your org files for stranger things. Currently mostly focused on soundness of org clocks."
+)]
 struct CheckOrgOptions {
-    #[arg(long = "duration-mismatch", default_value_t = true)]
-    report_duration_mismatch: bool,
-    #[arg(long = "long-duration", default_value_t = true)]
+    #[arg(
+        long = "report-long-durations",
+        default_value_t = true,
+        help = "Report about clocks with a long duration. [default: true]",
+        group = "long-duration"
+    )]
     report_long_duration: bool,
-    #[arg(long = "running-clock", default_value_t = true)]
+
+    #[arg(
+        value_parser = parse_duration_from_cli,
+        default_value = "10:00",
+        long = "long-duration",
+        help = "Duration used for --report-long-durations. HH:MM format.",
+        requires = "long-duration"
+    )]
+    long_duration: Duration,
+
+    #[arg(
+        long = "duration-mismatch",
+        default_value_t = true,
+        help = "Report clocks whose duration is incorrect. [default: true]"
+    )]
+    report_duration_mismatch: bool,
+
+    #[arg(
+        long = "report-running-clock",
+        default_value_t = false,
+        help = "Report the clocks that have no end timestamp. [default: false]"
+    )]
     report_running_clock: bool,
-    #[arg(long = "overlapping-clocks", default_value_t = true)]
-    report_overlapping_clocks: bool,
-    #[arg(long = "negative-duration", default_value_t = true)]
+
+    #[arg(
+        long = "negative-duration",
+        default_value_t = true,
+        help = "Report clocks having a negative duration, i.e. the end timestamp is more recent than start. [default: true]"
+    )]
     report_negative_duration: bool,
-    #[arg(long = "zero-clocks", default_value_t = true)]
+
+    #[arg(
+        long = "zero-clocks",
+        default_value_t = true,
+        help = "Report clocks whose start and end timestamp is the same. [default: true]"
+    )]
     report_zero_clocks: bool,
-    #[arg(long = "clock-conflicts", default_value_t = true)]
+
+    #[arg(
+        long = "clock-conflicts",
+        default_value_t = false,
+        help = "Report clock conflicts, i.e. clocks that overlap. [default: false]"
+    )]
     report_clock_conflicts: bool,
-    #[arg(long = "fix-clock-conflicts", default_value_t = false)]
+
+    #[arg(
+        long = "fix-clock-conflicts",
+        default_value_t = false,
+        help = "Interactively fix conflicted clocks. Goes through the clocks one by one and allows you to choose a resolution. [default: false]"
+    )]
     fix_clock_conflicts: bool,
-    #[arg(value_parser = parse_duration_from_cli)]
-    long_duration: Option<Duration>,
+
+    #[arg(
+        long = "org-dir",
+        help = "The org directory that contains the org files.",
+        group = "org-dir",
+        default_value = &**DEFAULT_ORG_DIR,
+    )]
+    org_dir: PathBuf,
+
+    #[arg(
+        long = "recursive",
+        default_value_t = true,
+        requires = "org-dir",
+        help = "Recursively find .org files in --org-dir. [default: true]"
+    )]
+    recursive: bool,
+
+    #[arg(
+        long = "org-file",
+        help = "Specify individual org files to lint. Overrides --org-dir."
+    )]
+    org_files: Option<Vec<PathBuf>>,
 }
 
 fn parse_duration_from_cli(s: &str) -> Result<Duration, String> {
@@ -111,25 +185,23 @@ fn main() -> Result<()> {
 
     let opts = CheckOrgOptions::parse();
 
-    #[allow(deprecated)]
-    let org_dir = std::env::home_dir().unwrap().join("org");
-
-    let files = fs::read_dir(&org_dir)?
-        .into_iter()
-        .filter_map(|file| {
-            let file = file.ok()?;
-            if file.file_type().ok()?.is_file()
-                && file.path().extension() == Some(&OsString::from_str("org").ok()?)
-            {
-                Some(file.path())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    // let files = vec![std::path::PathBuf::from("/Users/robert/org/clockin.org")];
-    // let files = vec![org_dir.join("test.org")];
+    let files = if let Some(files) = &opts.org_files {
+        files.clone()
+    } else {
+        fs::read_dir(&opts.org_dir)?
+            .into_iter()
+            .filter_map(|file| {
+                let file = file.ok()?;
+                if file.file_type().ok()?.is_file()
+                    && file.path().extension() == Some(&OsString::from_str("org").ok()?)
+                {
+                    Some(file.path())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
 
     let org_files = files
         .iter()
@@ -145,7 +217,6 @@ fn main() -> Result<()> {
     }
 
     // clock conflicts
-
     if opts.report_clock_conflicts {
         println!("finding clock conflicts...");
         for conflict in ClockConflict::find_conflicts(&docs) {
@@ -205,7 +276,8 @@ fn main() -> Result<()> {
 
 fn check_org(doc: &OrgDocument, opts: &CheckOrgOptions) {
     let file_name = doc.file_name();
-    let long_duration = opts.long_duration.unwrap_or_else(|| Duration::hours(10));
+    // let long_duration = opts.long_duration.unwrap_or_else(|| Duration::hours(10));
+    let long_duration = opts.long_duration;
 
     for clock in &doc.clocks {
         let duration_string_raw = clock.duration_string.unwrap_or("");

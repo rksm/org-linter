@@ -1,8 +1,6 @@
 use anyhow::Result;
-
-use regex::Regex;
-
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 pub struct Block<'a> {
     pub start_line: usize,
